@@ -10,6 +10,7 @@ from dgl.nn import NNConv
 import torch.nn as nn
 from sklearn.metrics import classification_report
 from itertools import combinations
+import optuna
 
 #CSV読み込み
 print("csv読み込み開始")
@@ -51,9 +52,9 @@ mcid_to_uuid = (
 #     ip_to_uuids[ip].add(uuid)
 
 print("教師ラベル読み込み開始")
-no_relation_label_df=pd.read_csv("no_relation_labels.csv")
-friend_label_df=pd.read_csv("friend_labels.csv")
-alt_label_df=pd.read_csv("alt_labels.csv")
+no_relation_label_df=pd.read_csv("train_no_relation_labels.csv")
+friend_label_df=pd.read_csv("train_friend_labels.csv")
+alt_label_df=pd.read_csv("train_alt_labels.csv")
 print("ラベル結合")
 supervised_label_df = pd.concat([no_relation_label_df, friend_label_df, alt_label_df], ignore_index=True)
 print("ノード変換")
@@ -72,18 +73,25 @@ supervised_src_ids = supervised_label_df["src_id"].values
 supervised_dst_ids = supervised_label_df["dst_id"].values
 supervised_labels = torch.tensor(supervised_label_df["label"].values, dtype=torch.long)
 
-# 元グラフのエッジ集合を作る
-# graph_edge_set = set(zip(graph.edges()[0].tolist(), graph.edges()[1].tolist()))
 
+print("テストデータ読み込み")
+test_no_relation_label_df=pd.read_csv("test_no_relation_labels.csv")
+test_friend_label_df=pd.read_csv("test_friend_labels.csv")
+test_alt_label_df=pd.read_csv("test_alt_labels.csv")
+print("ラベル結合")
+test_df = pd.concat([test_no_relation_label_df, test_friend_label_df, test_alt_label_df], ignore_index=True)
 
-# 元グラフに存在するエッジだけフィルタリング
-# filtered_pairs = [pair for pair in label_edge_pairs if pair in graph_edge_set]
+test_df["src"] = test_df["mcid_a"].map(mcid_to_uuid)
+test_df["dst"] = test_df["mcid_b"].map(mcid_to_uuid)
+test_df = test_df.dropna(subset=["src", "dst", "label"])
 
-# # src_ids, dst_ids, labelsをそれに合わせて再構成
-# filtered_src_ids = [p[0] for p in filtered_pairs]
-# filtered_dst_ids = [p[1] for p in filtered_pairs]
+test_df["src_id"] = test_df["src"].map(node_id_map).astype(int)
+test_df["dst_id"] = test_df["dst"].map(node_id_map).astype(int)
+test_df["label"] = test_df["label"].astype(int)
 
-# # フィルタリングされたエッジのインデックスを取得するために元ラベルの (src,dst) → index マップを作る
+test_src_ids = test_df["src_id"].values
+test_dst_ids = test_df["dst_id"].values
+test_labels = torch.tensor(test_df["label"].values, dtype=torch.long)
 
 
 print("エッジ特徴量計算開始")
@@ -192,7 +200,7 @@ def aggregate_edge_command_counts():
     #         data.append(counts)
     #         processed_pairs.add(pair)
 
-    print("ラベル付きエッジの特徴量計算開始")
+    print("trainデータの特徴量計算開始")
     print("合計"+str(len(supervised_label_df))+"個")
 
     for i,row in supervised_label_df.iterrows():
@@ -224,6 +232,40 @@ def aggregate_edge_command_counts():
         data.append(counts)
         processed_pairs.add((src,dst))
         processed_pairs.add((dst,src))
+
+    print("testデータの特徴量計算開始")
+    print("合計"+str(len(test_df))+"個")
+
+    for i,row in test_df.iterrows():
+        print(str(i)+"個目")
+        counts = {}
+        src=row["src"]
+        dst=row["dst"]
+        group=target_com_df[(target_com_df["uuid"]==src)&(target_com_df["target_uuid"]==dst)]
+        total=len(group)
+        for cmd in target_commands:
+            count=group["command"].str.startswith(cmd+" ").sum()
+            counts[cmd+"_amount"] =count
+            counts[cmd+"_ratio"]=count/total if total>0 else np.nan
+        counts["src"] = src
+        counts["dst"] = dst
+        counts["ipdup_ratio"]=ipDupRatio(src,dst)
+        data.append(counts)
+
+        counts = {}
+        group=target_com_df[(target_com_df["uuid"]==dst)&(target_com_df["target_uuid"]==src)]
+        total=len(group)
+        for cmd in target_commands:
+            count=group["command"].str.startswith(cmd+" ").sum()
+            counts[cmd+"_amount"] =count
+            counts[cmd+"_ratio"]=count/total if total>0 else np.nan
+        counts["src"] = dst
+        counts["dst"] = src
+        counts["ipdup_ratio"]=ipDupRatio(dst,src)
+        data.append(counts)
+        processed_pairs.add((src,dst))
+        processed_pairs.add((dst,src))
+
 
     print("残りのエッジの特徴量計算開始")
 
@@ -317,19 +359,16 @@ loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
 print("学習モデル構築開始")
 class NNConvNet(nn.Module):
-    def __init__(self, in_feats, edge_feats, hidden_feats, out_feats):
+    def __init__(self, in_feats, edge_feats, hidden_feats, out_feats,edge_mlp_hidden,dropout):
         super().__init__()
-        # エッジ重み生成ネットワーク（MLP）
         self.edge_network = nn.Sequential(
-            nn.Linear(edge_feats, hidden_feats * in_feats),
+            nn.Linear(edge_feats, edge_mlp_hidden * in_feats),
             nn.ReLU(),
-            nn.Linear(hidden_feats * in_feats, hidden_feats * in_feats)
+            nn.Linear(edge_mlp_hidden * in_feats, hidden_feats * in_feats)
         )
-        # NNConvレイヤー（ノード埋め込みを生成）
         self.conv = NNConv(in_feats, hidden_feats, self.edge_network)
         self.relu = nn.ReLU()
-
-        # エッジ分類MLP：src, dstノード埋め込み + エッジ特徴量 を入力
+        self.dropout = nn.Dropout(dropout)
         self.edge_classifier = nn.Sequential(
             nn.Linear(hidden_feats * 2 + edge_feats, hidden_feats),
             nn.ReLU(),
@@ -337,27 +376,57 @@ class NNConvNet(nn.Module):
         )
 
     def forward(self, g, node_feats, edge_feats, edge_indices):
-        # ノード埋め込み
         h = self.relu(self.conv(g, node_feats, edge_feats))
-
-        # ラベル付きエッジのsrc/dstインデックス
+        h = self.dropout(h)
         src, dst = g.find_edges(edge_indices)
-
-        # 各ラベル付きエッジに対し、ノード埋め込みとエッジ特徴を取り出す
         src_h = h[src]
         dst_h = h[dst]
         e_feat = edge_feats[edge_indices]
-
-        # エッジ特徴量とノード埋め込みを連結して分類器に渡す
         edge_input = torch.cat([src_h, dst_h, e_feat], dim=1)
         logits = self.edge_classifier(edge_input)
-
         return logits
+    # def __init__(self, in_feats, edge_feats, hidden_feats, out_feats,lr,edge_mlp_hidden,dropout):
+    #     super().__init__()
+    #     # エッジ重み生成ネットワーク（MLP）
+    #     self.edge_network = nn.Sequential(
+    #         nn.Linear(edge_feats, hidden_feats * in_feats),
+    #         nn.ReLU(),
+    #         nn.Linear(hidden_feats * in_feats, hidden_feats * in_feats)
+    #     )
+    #     # NNConvレイヤー（ノード埋め込みを生成）
+    #     self.conv = NNConv(in_feats, hidden_feats, self.edge_network)
+    #     self.relu = nn.ReLU()
+    #     self.dropout = nn.Dropout(dropout)
+
+    #     # エッジ分類MLP：src, dstノード埋め込み + エッジ特徴量 を入力
+    #     self.edge_classifier = nn.Sequential(
+    #         nn.Linear(hidden_feats * 2 + edge_feats, hidden_feats),
+    #         nn.ReLU(),
+    #         nn.Linear(hidden_feats, out_feats)
+    #     )
+
+    # def forward(self, g, node_feats, edge_feats, edge_indices):
+    #     # ノード埋め込み
+    #     h = self.relu(self.conv(g, node_feats, edge_feats))
+
+    #     # ラベル付きエッジのsrc/dstインデックス
+    #     src, dst = g.find_edges(edge_indices)
+
+    #     # 各ラベル付きエッジに対し、ノード埋め込みとエッジ特徴を取り出す
+    #     src_h = h[src]
+    #     dst_h = h[dst]
+    #     e_feat = edge_feats[edge_indices]
+
+    #     # エッジ特徴量とノード埋め込みを連結して分類器に渡す
+    #     edge_input = torch.cat([src_h, dst_h, e_feat], dim=1)
+    #     logits = self.edge_classifier(edge_input)
+
+    #     return logits
 supervised_label_edge_indices = graph.edge_ids(supervised_src_ids, supervised_dst_ids)
-model = NNConvNet(in_feats=node_features.shape[1],edge_feats=edge_feats.shape[1], hidden_feats=64, out_feats=3)
+model = NNConvNet(in_feats=node_features.shape[1],edge_feats=edge_feats.shape[1], hidden_feats=50, out_feats=3,dropout=0.4550633917745034,edge_mlp_hidden=57)
 logits = model(graph, graph.ndata['feat'],graph.edata["feat"],supervised_label_edge_indices)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.007554552733655542)
 
 #モデルのチェック
 print(np.isnan(node_features).any())
@@ -367,7 +436,7 @@ print(torch.isnan(logits).any())
 
 #過学習対策
 best_loss = float('inf')
-patience = 10
+patience = 5
 
 #連続でロスの更新がされなかった回数をカウント
 counter = 0
@@ -402,15 +471,89 @@ for epoch in range(160):
         print(f"Early stopping at epoch {epoch}")
         break
 
+test_edge_indices = graph.edge_ids(test_src_ids, test_dst_ids)
+
 model.eval()
 with torch.no_grad():
-    all_edge_ids = torch.arange(graph.num_edges())  # 全エッジのID
-    logits = model(graph, graph.ndata['feat'], graph.edata['feat'], all_edge_ids)
-    predictions = torch.argmax(logits, dim=1)
-with torch.no_grad():
-    logits = model(graph, graph.ndata['feat'], graph.edata['feat'], supervised_label_edge_indices)
-    pred_labels = torch.argmax(logits, dim=1)
+    test_logits = model(graph, graph.ndata['feat'], graph.edata['feat'], test_edge_indices)
+    test_pred = torch.argmax(test_logits, dim=1)
 
-print(classification_report(supervised_labels.numpy(), pred_labels.numpy(),labels=[0,1,2]))
+print("=== Test Classification Report ===")
+print(classification_report(test_labels.numpy(), test_pred.numpy(), labels=[0,1,2]))
 
 torch.save(model.state_dict(), "best_model.pt")
+
+# ハイパーパラメータ選定するやつ
+# print("optunaでやってみよう")
+# def objective(trial):
+#     # 最適化対象のハイパーパラメータ
+#     hidden_feats = trial.suggest_int("hidden_feats", 16, 128)
+#     edge_mlp_hidden = trial.suggest_int("edge_mlp_hidden", 16, 128)
+#     lr = trial.suggest_loguniform("lr", 1e-4, 1e-2)
+#     dropout_rate = trial.suggest_uniform("dropout", 0.0, 0.5)
+
+#     class NNConvNet(nn.Module):
+#         def __init__(self, in_feats, edge_feats, hidden_feats, out_feats):
+#             super().__init__()
+#             self.edge_network = nn.Sequential(
+#                 nn.Linear(edge_feats, edge_mlp_hidden * in_feats),
+#                 nn.ReLU(),
+#                 nn.Linear(edge_mlp_hidden * in_feats, hidden_feats * in_feats)
+#             )
+#             self.conv = NNConv(in_feats, hidden_feats, self.edge_network)
+#             self.relu = nn.ReLU()
+#             self.dropout = nn.Dropout(dropout_rate)
+#             self.edge_classifier = nn.Sequential(
+#                 nn.Linear(hidden_feats * 2 + edge_feats, hidden_feats),
+#                 nn.ReLU(),
+#                 nn.Linear(hidden_feats, out_feats)
+#             )
+
+#         def forward(self, g, node_feats, edge_feats, edge_indices):
+#             h = self.relu(self.conv(g, node_feats, edge_feats))
+#             h = self.dropout(h)
+#             src, dst = g.find_edges(edge_indices)
+#             src_h = h[src]
+#             dst_h = h[dst]
+#             e_feat = edge_feats[edge_indices]
+#             edge_input = torch.cat([src_h, dst_h, e_feat], dim=1)
+#             logits = self.edge_classifier(edge_input)
+#             return logits
+
+#     model = NNConvNet(
+#         in_feats=node_features.shape[1],
+#         edge_feats=edge_feats.shape[1],
+#         hidden_feats=hidden_feats,
+#         out_feats=3
+#     )
+
+#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+#     # Early stopping
+#     best_loss = float('inf')
+#     counter = 0
+#     patience = 5
+
+#     for epoch in range(100):  # 最大100エポック
+#         model.train()
+#         optimizer.zero_grad()
+#         logits = model(graph, graph.ndata['feat'], graph.edata['feat'], supervised_label_edge_indices)
+#         loss = loss_fn(logits, supervised_labels)
+#         loss.backward()
+#         optimizer.step()
+
+#         val_loss = evaluate_validation_loss(model, graph, supervised_label_edge_indices, supervised_labels, loss_fn)
+#         if val_loss < best_loss:
+#             best_loss = val_loss
+#             counter = 0
+#         else:
+#             counter += 1
+#         if counter >= patience:
+#             break
+
+#     return best_loss
+
+# study = optuna.create_study(direction="minimize")
+# study.optimize(objective, n_trials=30)  # 30回試す
+
+# print("Best params:", study.best_params)
