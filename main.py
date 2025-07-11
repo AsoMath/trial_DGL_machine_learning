@@ -55,27 +55,26 @@ no_relation_label_df=pd.read_csv("no_relation_labels.csv")
 friend_label_df=pd.read_csv("friend_labels.csv")
 alt_label_df=pd.read_csv("alt_labels.csv")
 print("ラベル結合")
-label_df = pd.concat([no_relation_label_df, friend_label_df, alt_label_df], ignore_index=True)
+supervised_label_df = pd.concat([no_relation_label_df, friend_label_df, alt_label_df], ignore_index=True)
 print("ノード変換")
-label_df["src"]=label_df["mcid_a"].map(mcid_to_uuid)
-label_df["dst"]=label_df["mcid_b"].map(mcid_to_uuid)
-label_df["src_id"] = label_df["src"].map(node_id_map)
-label_df["dst_id"] = label_df["dst"].map(node_id_map)
+supervised_label_df["src"]=supervised_label_df["mcid_a"].map(mcid_to_uuid)
+supervised_label_df["dst"]=supervised_label_df["mcid_b"].map(mcid_to_uuid)
+supervised_label_df["src_id"] = supervised_label_df["src"].map(node_id_map)
+supervised_label_df["dst_id"] = supervised_label_df["dst"].map(node_id_map)
 print("不正ラベル消去")
-label_df = label_df.dropna(subset=["src_id", "dst_id"])
-label_df=label_df.dropna(subset=["label"])
-label_df["src_id"] = label_df["src_id"].astype(int)
-label_df["dst_id"] = label_df["dst_id"].astype(int)
+supervised_label_df = supervised_label_df.dropna(subset=["src_id", "dst_id"])
+supervised_label_df=supervised_label_df.dropna(subset=["label"])
+supervised_label_df["src_id"] = supervised_label_df["src_id"].astype(int)
+supervised_label_df["dst_id"] = supervised_label_df["dst_id"].astype(int)
+supervised_label_df["label"] = supervised_label_df["label"].astype(int)
 
-src_ids = label_df["src_id"].values
-dst_ids = label_df["dst_id"].values
-labels = label_df["label"].values
+supervised_src_ids = supervised_label_df["src_id"].values
+supervised_dst_ids = supervised_label_df["dst_id"].values
+supervised_labels = torch.tensor(supervised_label_df["label"].values, dtype=torch.long)
 
 # 元グラフのエッジ集合を作る
 # graph_edge_set = set(zip(graph.edges()[0].tolist(), graph.edges()[1].tolist()))
 
-# ラベルデータの (src, dst) をzipで取り出す
-# label_edge_pairs = list(zip(src_ids, dst_ids))
 
 # 元グラフに存在するエッジだけフィルタリング
 # filtered_pairs = [pair for pair in label_edge_pairs if pair in graph_edge_set]
@@ -85,10 +84,6 @@ labels = label_df["label"].values
 # filtered_dst_ids = [p[1] for p in filtered_pairs]
 
 # # フィルタリングされたエッジのインデックスを取得するために元ラベルの (src,dst) → index マップを作る
-# label_index_map = {(s,d): i for i, (s,d) in enumerate(label_edge_pairs)}
-
-# filtered_label_indices = [label_index_map[p] for p in filtered_pairs]
-# filtered_labels = torch.tensor(labels[filtered_label_indices], dtype=torch.long)
 
 
 print("エッジ特徴量計算開始")
@@ -198,9 +193,9 @@ def aggregate_edge_command_counts():
     #         processed_pairs.add(pair)
 
     print("ラベル付きエッジの特徴量計算開始")
-    print("合計"+str(len(label_df))+"個")
+    print("合計"+str(len(supervised_label_df))+"個")
 
-    for i,row in label_df.iterrows():
+    for i,row in supervised_label_df.iterrows():
         print(str(i)+"個目")
         counts = {}
         src=row["src"]
@@ -299,8 +294,8 @@ for node in all_nodes:
 
 node_features = np.array(node_features, dtype=np.float32)
 print("グラフ作成開始")
-src_ids = edge_feature_df["src"].map(node_id_map).values
-dst_ids = edge_feature_df["dst"].map(node_id_map).values
+src_ids = edge_feature_df["src"].map(node_id_map).values.astype(np.int64)
+dst_ids = edge_feature_df["dst"].map(node_id_map).values.astype(np.int64)
 graph = dgl.graph((src_ids, dst_ids), num_nodes=len(all_nodes))
 graph.ndata['feat'] = torch.tensor(node_features, dtype=torch.float32)
 edge_feats = edge_feature_df.drop(columns=["src", "dst"]).to_numpy()
@@ -309,15 +304,14 @@ print(graph)
 print("Node features shape:", graph.ndata['feat'].shape)
 print("Edge features shape:", graph.edata['feat'].shape)
 
-#教師ありのエッジ作成
-train_edges = dgl.graph((src_ids, dst_ids), num_nodes=graph.num_nodes())
-train_edges.edata["label"] = labels
-for s in labels:
-    if not s in np.array([0,1,2]):
-        print(str(s)+"が入ってるよん")
+label_edge_pairs = list(zip(src_ids, dst_ids))
+label_index_map = {(s,d): i for i, (s,d) in enumerate(label_edge_pairs)}
+
+
+#損失関数の作成
 class_weights = compute_class_weight(class_weight='balanced',
                                      classes=np.array([0, 1, 2]),
-                                     y=labels)
+                                     y=supervised_labels.numpy())
 class_weights = torch.tensor(class_weights, dtype=torch.float32)
 loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
@@ -359,16 +353,16 @@ class NNConvNet(nn.Module):
         logits = self.edge_classifier(edge_input)
 
         return logits
-label_edge_indices = graph.edge_ids(src_ids, dst_ids)
+supervised_label_edge_indices = graph.edge_ids(supervised_src_ids, supervised_dst_ids)
 model = NNConvNet(in_feats=node_features.shape[1],edge_feats=edge_feats.shape[1], hidden_feats=64, out_feats=3)
-logits = model(graph, graph.ndata['feat'],graph.edata["feat"],label_edge_indices)
+logits = model(graph, graph.ndata['feat'],graph.edata["feat"],supervised_label_edge_indices)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 #モデルのチェック
 print(np.isnan(node_features).any())
 print(np.isnan(edge_feats).any())
-print(np.isnan(labels).any())
+print(np.isnan(supervised_labels).any())
 print(torch.isnan(logits).any())
 
 #過学習対策
@@ -386,18 +380,17 @@ def evaluate_validation_loss(model, graph, edge_idx, labels, loss_fn):
 
 print("学習開始")
 for epoch in range(160):
-    print(str(epoch)+"回目")
     model.train()
     optimizer.zero_grad()
 
-    logits = model(graph, graph.ndata['feat'], graph.edata['feat'],label_edge_indices)
-    loss = loss_fn(logits, labels)
+    logits = model(graph, graph.ndata['feat'], graph.edata['feat'],supervised_label_edge_indices)
+    loss = loss_fn(logits, supervised_labels)
 
     loss.backward()
     optimizer.step()
 
     print(f"Epoch {epoch}, loss: {loss.item()}")
-    val_loss = evaluate_validation_loss(model,graph,label_edge_indices,labels,loss_fn)
+    val_loss = evaluate_validation_loss(model,graph,supervised_label_edge_indices,supervised_labels,loss_fn)
 
     if val_loss < best_loss:
         best_loss = val_loss
@@ -415,9 +408,9 @@ with torch.no_grad():
     logits = model(graph, graph.ndata['feat'], graph.edata['feat'], all_edge_ids)
     predictions = torch.argmax(logits, dim=1)
 with torch.no_grad():
-    logits = model(graph, graph.ndata['feat'], graph.edata['feat'], label_edge_indices)
+    logits = model(graph, graph.ndata['feat'], graph.edata['feat'], supervised_label_edge_indices)
     pred_labels = torch.argmax(logits, dim=1)
 
-print(classification_report(labels.numpy(), pred_labels.numpy(),labels=[0,1,2]))
+print(classification_report(supervised_labels.numpy(), pred_labels.numpy(),labels=[0,1,2]))
 
 torch.save(model.state_dict(), "best_model.pt")
